@@ -22,6 +22,173 @@
 #include "assets/ast_area_6.h"
 #include "assets/ast_zoness.h"
 #include "port/hooks/Events.h"
+#include "public/bridge/controllerbridge.h"
+
+#define FFB_CVAR_ENABLED "gSidewinderFFB.Enabled"
+#define FFB_CVAR_SPRING "gSidewinderFFB.SpringStrength"
+#define FFB_CVAR_DAMPER "gSidewinderFFB.DamperStrength"
+#define FFB_CVAR_FLIGHT_MODEL "gSidewinderFFB.FlightModel"
+#define FFB_CVAR_RECOIL "gSidewinderFFB.Recoil"
+#define FFB_CVAR_DAMAGE "gSidewinderFFB.Damage"
+
+static u8 Player_FFBPort(Player* player) {
+    return gVersusMode ? player->num : gMainController;
+}
+
+static bool Player_FFBActive(Player* player) {
+    return (CVarGetInteger(FFB_CVAR_ENABLED, 1) != 0) && ControllerHasForceFeedback(Player_FFBPort(player));
+}
+
+static u16 Player_FFBStrength(s32 baseStrength) {
+    s32 strength = baseStrength;
+
+    if (strength < 0) {
+        strength = 0;
+    }
+    if (strength > INT16_MAX) {
+        strength = INT16_MAX;
+    }
+    return strength;
+}
+
+static void Player_FFBLaserRecoil(Player* player, LaserStrength laser) {
+    s32 strength;
+
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_RECOIL, 1) == 0)) {
+        return;
+    }
+
+    switch (laser) {
+        case LASERS_TWIN:
+            strength = 11500;
+            break;
+        case LASERS_HYPER:
+            strength = 15500;
+            break;
+        case LASERS_SINGLE:
+        default:
+            strength = 8500;
+            break;
+    }
+
+    ControllerFFBPlayConstant(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(strength), 55);
+}
+
+static void Player_FFBBombRecoil(Player* player) {
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_RECOIL, 1) == 0)) {
+        return;
+    }
+
+    ControllerFFBPlayConstant(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(23000), 140);
+    ControllerFFBPlayPeriodic(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(13000), 35, 200);
+}
+
+static void Player_FFBDamageDirection(s32 direction, f32* x, f32* y) {
+    switch (direction) {
+        case 1:
+            *x = -1.0f;
+            *y = 0.0f;
+            break;
+        case 2:
+            *x = 1.0f;
+            *y = 0.0f;
+            break;
+        case 3:
+            *x = 0.0f;
+            *y = -1.0f;
+            break;
+        case 4:
+            *x = 0.0f;
+            *y = 1.0f;
+            break;
+        default:
+            *x = 0.0f;
+            *y = 1.0f;
+            break;
+    }
+}
+
+static void Player_FFBDamageHit(Player* player, s32 direction, s32 damage) {
+    f32 x;
+    f32 y;
+
+    if ((damage <= 0) || !Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_DAMAGE, 1) == 0)) {
+        return;
+    }
+
+    Player_FFBDamageDirection(direction, &x, &y);
+    ControllerFFBPlayConstant(Player_FFBPort(player), x, y, Player_FFBStrength(10000 + (damage * 500)), 130);
+}
+
+static void Player_FFBDamageShake(Player* player) {
+    f32 x;
+    f32 y;
+    s32 strength;
+
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_DAMAGE, 1) == 0) || ((gGameFrameCount % 4) != 0)) {
+        return;
+    }
+
+    Player_FFBDamageDirection(player->hitDirection, &x, &y);
+    strength = 7500 + (s32) (fabsf(player->damageShake) * 850.0f);
+    ControllerFFBPlayPeriodic(Player_FFBPort(player), x, y, Player_FFBStrength(strength), 28, 90);
+}
+
+static void Player_FFBUpdateFlightModel(Player* player) {
+    s32 spring;
+    s32 damper;
+    f32 speedLoad;
+    f32 bankLoad;
+    bool flightModelEnabled;
+
+    if ((CVarGetInteger(FFB_CVAR_ENABLED, 1) == 0) && ControllerHasForceFeedback(Player_FFBPort(player))) {
+        if ((gGameFrameCount % 30) == 0) {
+            ControllerFFBUpdateSpringDamper(Player_FFBPort(player), 0, 0, 0);
+        }
+        return;
+    }
+
+    if (!Player_FFBActive(player)) {
+        return;
+    }
+
+    spring = CVarGetInteger(FFB_CVAR_SPRING, 15000);
+    damper = CVarGetInteger(FFB_CVAR_DAMPER, 9000);
+    flightModelEnabled = CVarGetInteger(FFB_CVAR_FLIGHT_MODEL, 1) != 0;
+
+    if (flightModelEnabled) {
+        speedLoad = fabsf(player->baseSpeed + player->boostSpeed);
+        spring += (s32) (speedLoad * 220.0f);
+        damper += (s32) (speedLoad * 90.0f);
+
+        if (player->boostActive) {
+            spring += 4500;
+            damper += 3000;
+        }
+
+        bankLoad = player->bankAngle / 180.0f;
+        if (bankLoad > 1.0f) {
+            bankLoad = 1.0f;
+        } else if (bankLoad < -1.0f) {
+            bankLoad = -1.0f;
+        }
+
+        if (fabsf(bankLoad) > 0.2f && ((gGameFrameCount % 16) == 0)) {
+            ControllerFFBPlayConstant(Player_FFBPort(player), bankLoad, 0.0f,
+                                      Player_FFBStrength((s32) (fabsf(bankLoad) * 6500.0f)), 60);
+        }
+
+        if ((player->boostActive || (speedLoad > 24.0f)) && ((gGameFrameCount % 30) == 0)) {
+            ControllerFFBPlayPeriodic(Player_FFBPort(player), 0.0f, 1.0f,
+                                      Player_FFBStrength(player->boostActive ? 5200 : 2600), 70, 80);
+        }
+    }
+
+    if ((gGameFrameCount % 20) == 0) {
+        ControllerFFBUpdateSpringDamper(Player_FFBPort(player), 1, Player_FFBStrength(spring),
+                                        Player_FFBStrength(damper));
+    }
+}
 
 extern float gCurrentScreenWidth;
 extern float gCurrentScreenHeight;
@@ -997,6 +1164,7 @@ void Player_ApplyDamage(Player* player, s32 direction, s32 damage) {
 
     player->unk_284 = 0;
     player->hitTimer = 20;
+    Player_FFBDamageHit(player, direction, damage);
 
     if (player->dmgType > 40) {
         sp34 = (player->boostSpeed * 0.3f) + 20.0f;
@@ -3181,6 +3349,7 @@ void Player_ArwingLaser(Player* player) {
                     Player_SetupArwingShot(player, &gPlayerShots[i], 0.0f, 0.0f, PLAYERSHOT_SINGLE_LASER,
                                            400.0f / 3.0f);
                     Player_PlaySfx(player->sfxSource, NA_SE_ARWING_SHOT, player->num);
+                    Player_FFBLaserRecoil(player, laser);
                     gMuzzleFlashScale[player->num] = 0.5f;
                     break;
                 }
@@ -3200,6 +3369,7 @@ void Player_ArwingLaser(Player* player) {
                         Player_PlaySfx(player->sfxSource, NA_SE_ARWING_TWIN_LASER2, player->num);
                         gMuzzleFlashScale[player->num] = 0.75f;
                     }
+                    Player_FFBLaserRecoil(player, laser);
                     break;
                 }
             }
@@ -3233,6 +3403,7 @@ void Player_SmartBomb(Player* player) {
         gPlayerShots[ARRAY_COUNT(gPlayerShots) - 1].unk_60 = 0;
         Audio_InitBombSfx(player->num, 1);
         Audio_PlayBombFlightSfx(player->num, gPlayerShots[ARRAY_COUNT(gPlayerShots) - 1].sfxSource);
+        Player_FFBBombRecoil(player);
         CALL_EVENT(PlayerActionPostBombEvent, player);
     }
 }
@@ -5589,6 +5760,7 @@ void Player_UpdateEffects(Player* player) {
                 SIN_DEG(player->hitTimer * 400.0f) * player->hitTimer * D_800D3164[player->hitDirection] * 1.5f;
             player->xShake = 0.0f;
         }
+        Player_FFBDamageShake(player);
 
         if ((gLevelMode != LEVELMODE_TURRET) &&
             ((player->knockback.x != 0.f) || (player->knockback.y != 0.f) || (player->knockback.z != 0.f)) &&
@@ -5900,6 +6072,7 @@ void Player_Update(Player* player) {
             *gControllerRumble = 1;
         }
     }
+    Player_FFBUpdateFlightModel(player);
     if (player->state > PLAYERSTATE_INIT) {
         Player_UpdateEffects(player);
     }

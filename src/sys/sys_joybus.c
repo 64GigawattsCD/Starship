@@ -1,4 +1,5 @@
 #include "sys.h"
+#include "public/bridge/consolevariablebridge.h"
 
 OSContPad gControllerHold[4];
 OSContPad gControllerPress[4];
@@ -72,7 +73,12 @@ void Controller_UpdateInput(void) {
             gControllerHold[i] = sNextController[i];
             gControllerPress[i].button =
                 (gControllerHold[i].button ^ sPrevController[i].button) & gControllerHold[i].button;
-            Controller_AddDeadZone(i);
+            if (CVarGetInteger("gUseOriginalStickDeadzone", 0) != 0) {
+                Controller_AddDeadZone(i);
+            } else {
+                gControllerPress[i].stick_x = gControllerHold[i].stick_x;
+                gControllerPress[i].stick_y = gControllerHold[i].stick_y;
+            }
         } else {
             gControllerHold[i].button = gControllerHold[i].stick_x = gControllerHold[i].stick_y =
                 gControllerHold[i].err_no = gControllerPress[i].button = gControllerPress[i].stick_x =

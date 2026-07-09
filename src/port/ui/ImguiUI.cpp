@@ -359,6 +359,11 @@ void DrawSettingsMenu(){
                 .tooltip = "Inverts the Y axis for controlling vehicles"
             });
 
+            UIWidgets::CVarCheckbox("Original Stick Dead Zone", "gUseOriginalStickDeadzone", {
+                .tooltip = "Applies the original N64 stick dead zone before gameplay receives analog input.",
+                .defaultValue = false
+            });
+
             ImGui::EndMenu();
         }
 
