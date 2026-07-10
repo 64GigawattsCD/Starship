@@ -28,8 +28,27 @@
 #define FFB_CVAR_SPRING "gSidewinderFFB.SpringStrength"
 #define FFB_CVAR_DAMPER "gSidewinderFFB.DamperStrength"
 #define FFB_CVAR_FLIGHT_MODEL "gSidewinderFFB.FlightModel"
+#define FFB_CVAR_HEADING_PID "gSidewinderFFB.HeadingPID"
+#define FFB_CVAR_HEADING_PID_STRENGTH "gSidewinderFFB.HeadingPIDStrength"
+#define FFB_CVAR_HEADING_PID_P "gSidewinderFFB.HeadingPID.P"
+#define FFB_CVAR_HEADING_PID_I "gSidewinderFFB.HeadingPID.I"
+#define FFB_CVAR_HEADING_PID_D "gSidewinderFFB.HeadingPID.D"
 #define FFB_CVAR_RECOIL "gSidewinderFFB.Recoil"
 #define FFB_CVAR_DAMAGE "gSidewinderFFB.Damage"
+#define FFB_SQUARE_PLAYER_COUNT 4
+#define FFB_PID_PLAYER_COUNT 4
+
+static s32 sFFBSquareFramesRemaining[FFB_SQUARE_PLAYER_COUNT];
+static s32 sFFBSquareHalfPeriodFrames[FFB_SQUARE_PLAYER_COUNT];
+static bool sFFBSquarePhase[FFB_SQUARE_PLAYER_COUNT];
+static f32 sFFBSquareDirectionX[FFB_SQUARE_PLAYER_COUNT];
+static f32 sFFBSquareDirectionY[FFB_SQUARE_PLAYER_COUNT];
+static u16 sFFBSquareStrength[FFB_SQUARE_PLAYER_COUNT];
+static u16 sFFBSquarePulseLength[FFB_SQUARE_PLAYER_COUNT];
+static f32 sFFBHeadingIntegralX[FFB_PID_PLAYER_COUNT];
+static f32 sFFBHeadingIntegralY[FFB_PID_PLAYER_COUNT];
+static f32 sFFBHeadingPreviousErrorX[FFB_PID_PLAYER_COUNT];
+static f32 sFFBHeadingPreviousErrorY[FFB_PID_PLAYER_COUNT];
 
 static u8 Player_FFBPort(Player* player) {
     return gVersusMode ? player->num : gMainController;
@@ -51,8 +70,178 @@ static u16 Player_FFBStrength(s32 baseStrength) {
     return strength;
 }
 
+static f32 Player_FFBClampF(f32 value, f32 min, f32 max) {
+    if (value < min) {
+        return min;
+    }
+    if (value > max) {
+        return max;
+    }
+    return value;
+}
+
+static f32 Player_FFBAngleToSigned(f32 angle) {
+    while (angle > 180.0f) {
+        angle -= 360.0f;
+    }
+    while (angle < -180.0f) {
+        angle += 360.0f;
+    }
+    return angle;
+}
+
+static s32 Player_FFBPIDIndex(Player* player) {
+    if ((player->num >= 0) && (player->num < FFB_PID_PLAYER_COUNT)) {
+        return player->num;
+    }
+    return 0;
+}
+
+static s32 Player_FFBSquareIndex(Player* player) {
+    if ((player->num >= 0) && (player->num < FFB_SQUARE_PLAYER_COUNT)) {
+        return player->num;
+    }
+    return 0;
+}
+
+static s32 Player_FFBFramesFromMs(u16 lengthMs) {
+    return MAX((lengthMs + 15) / 16, 1);
+}
+
+static void Player_FFBStartSquare(Player* player, f32 directionX, f32 directionY, u16 strength, u16 periodMs,
+                                  u16 lengthMs) {
+    s32 index = Player_FFBSquareIndex(player);
+
+    sFFBSquareFramesRemaining[index] = Player_FFBFramesFromMs(lengthMs);
+    sFFBSquareHalfPeriodFrames[index] = Player_FFBFramesFromMs(periodMs / 2);
+    sFFBSquarePulseLength[index] = MAX(periodMs / 2, 16);
+    sFFBSquarePhase[index] = false;
+    sFFBSquareDirectionX[index] = directionX;
+    sFFBSquareDirectionY[index] = directionY;
+    sFFBSquareStrength[index] = strength;
+}
+
+static void Player_FFBUpdateSquare(Player* player) {
+    s32 index = Player_FFBSquareIndex(player);
+    f32 phaseSign;
+
+    if (sFFBSquareFramesRemaining[index] <= 0) {
+        return;
+    }
+
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_RECOIL, 1) == 0)) {
+        sFFBSquareFramesRemaining[index] = 0;
+        return;
+    }
+
+    if ((sFFBSquareFramesRemaining[index] % sFFBSquareHalfPeriodFrames[index]) == 0) {
+        phaseSign = sFFBSquarePhase[index] ? -1.0f : 1.0f;
+        ControllerFFBPlayConstant(Player_FFBPort(player), sFFBSquareDirectionX[index] * phaseSign,
+                                  sFFBSquareDirectionY[index] * phaseSign, sFFBSquareStrength[index],
+                                  sFFBSquarePulseLength[index]);
+        sFFBSquarePhase[index] = !sFFBSquarePhase[index];
+    }
+
+    sFFBSquareFramesRemaining[index]--;
+}
+
+static void Player_FFBResetHeadingPID(Player* player) {
+    s32 index = Player_FFBPIDIndex(player);
+
+    sFFBHeadingIntegralX[index] = 0.0f;
+    sFFBHeadingIntegralY[index] = 0.0f;
+    sFFBHeadingPreviousErrorX[index] = 0.0f;
+    sFFBHeadingPreviousErrorY[index] = 0.0f;
+}
+
+static void Player_FFBUpdateHeadingPID(Player* player) {
+    s32 index;
+    f32 targetX;
+    f32 targetY;
+    f32 stickX;
+    f32 stickY;
+    f32 errorX;
+    f32 errorY;
+    f32 outputX;
+    f32 outputY;
+    f32 magnitude;
+    f32 pGain;
+    f32 iGain;
+    f32 dGain;
+    s32 strength;
+
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_FLIGHT_MODEL, 1) == 0) ||
+        (CVarGetInteger(FFB_CVAR_HEADING_PID, 1) == 0) || ((gGameFrameCount % 3) != 0) ||
+        (player->form != FORM_ARWING)) {
+        Player_FFBResetHeadingPID(player);
+        return;
+    }
+
+    index = Player_FFBPIDIndex(player);
+    targetX = Player_FFBClampF(-player->rot.y / 35.0f, -1.0f, 1.0f);
+    targetY = Player_FFBClampF(Player_FFBAngleToSigned(player->xRot_120 + player->rot.x + player->aerobaticPitch) /
+                                   35.0f,
+                               -1.0f, 1.0f);
+    stickX = Player_FFBClampF(gInputPress->stick_x / 80.0f, -1.0f, 1.0f);
+    stickY = Player_FFBClampF(-gInputPress->stick_y / 80.0f, -1.0f, 1.0f);
+
+    errorX = targetX - stickX;
+    errorY = targetY - stickY;
+    sFFBHeadingIntegralX[index] = Player_FFBClampF(sFFBHeadingIntegralX[index] + errorX, -1.0f, 1.0f);
+    sFFBHeadingIntegralY[index] = Player_FFBClampF(sFFBHeadingIntegralY[index] + errorY, -1.0f, 1.0f);
+
+    pGain = CVarGetFloat(FFB_CVAR_HEADING_PID_P, 0.70f);
+    iGain = CVarGetFloat(FFB_CVAR_HEADING_PID_I, 0.04f);
+    dGain = CVarGetFloat(FFB_CVAR_HEADING_PID_D, 0.22f);
+    outputX = (pGain * errorX) + (iGain * sFFBHeadingIntegralX[index]) +
+              (dGain * (errorX - sFFBHeadingPreviousErrorX[index]));
+    outputY = (pGain * errorY) + (iGain * sFFBHeadingIntegralY[index]) +
+              (dGain * (errorY - sFFBHeadingPreviousErrorY[index]));
+    sFFBHeadingPreviousErrorX[index] = errorX;
+    sFFBHeadingPreviousErrorY[index] = errorY;
+
+    magnitude = sqrtf(SQ(outputX) + SQ(outputY));
+    if (magnitude < 0.05f) {
+        return;
+    }
+
+    outputX /= magnitude;
+    outputY /= magnitude;
+    strength = CVarGetInteger(FFB_CVAR_HEADING_PID_STRENGTH, 17000);
+    if (player->boostSpeed < -0.5f) {
+        strength /= 2;
+    } else if (player->boostActive || (player->boostSpeed > 0.5f)) {
+        strength *= 2;
+    }
+    strength = (s32) (Player_FFBClampF(magnitude, 0.0f, 1.0f) * strength);
+    ControllerFFBPlayConstantWithEnvelope(Player_FFBPort(player), outputX, outputY, Player_FFBStrength(strength), 55, 0,
+                                          0);
+}
+
+static void Player_FFBChargeShotCharging(Player* player) {
+    s32 chargeTimer;
+    s32 strength;
+    u16 periodMs;
+
+    if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_RECOIL, 1) == 0) || (player->form != FORM_ARWING) ||
+        ((gGameFrameCount % 5) != 0)) {
+        return;
+    }
+
+    chargeTimer = gChargeTimers[player->num];
+    if (chargeTimer <= 0) {
+        return;
+    }
+
+    strength = 2500 + (chargeTimer * 450);
+    periodMs = MAX(80 - (chargeTimer * 2), 35);
+    ControllerFFBPlayPeriodicWithFade(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(strength), periodMs, 100,
+                                      35);
+}
+
 static void Player_FFBLaserRecoil(Player* player, LaserStrength laser) {
     s32 strength;
+    u16 durationMs;
 
     if (!Player_FFBActive(player) || (CVarGetInteger(FFB_CVAR_RECOIL, 1) == 0)) {
         return;
@@ -60,18 +249,23 @@ static void Player_FFBLaserRecoil(Player* player, LaserStrength laser) {
 
     switch (laser) {
         case LASERS_TWIN:
-            strength = 11500;
+            strength = 16500;
+            durationMs = 50;
             break;
         case LASERS_HYPER:
-            strength = 15500;
+            strength = 25000;
+            durationMs = 65;
             break;
         case LASERS_SINGLE:
         default:
-            strength = 8500;
+            strength = 12500;
+            durationMs = 35;
             break;
     }
 
-    ControllerFFBPlayConstant(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(strength), 55);
+    ControllerFFBPlayConstant(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(strength), durationMs);
+    ControllerFFBPlayPeriodicWithFade(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(strength), 20,
+                                      durationMs * 2, durationMs * 2);
 }
 
 static void Player_FFBBombRecoil(Player* player) {
@@ -80,7 +274,7 @@ static void Player_FFBBombRecoil(Player* player) {
     }
 
     ControllerFFBPlayConstant(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(23000), 140);
-    ControllerFFBPlayPeriodic(Player_FFBPort(player), 0.0f, -1.0f, Player_FFBStrength(13000), 35, 200);
+    Player_FFBStartSquare(player, 0.0f, -1.0f, Player_FFBStrength(13000), 35, 200);
 }
 
 static void Player_FFBDamageDirection(s32 direction, f32* x, f32* y) {
@@ -3518,6 +3712,7 @@ bool Player_UpdateLockOn(Player* player) {
         if (gChargeTimers[player->num] == 20) {
             Object_PlayerSfx(player->sfxSource, NA_SE_LOCK_SEARCH, player->num);
         }
+        Player_FFBChargeShotCharging(player);
         if (!((gInputHold->button & R_TRIG) && (gInputHold->button & Z_TRIG) && (player->form == FORM_ARWING) &&
               (player->state == PLAYERSTATE_ACTIVE)) &&
             ((gGameFrameCount % 4) == 0) && Player_CanLockOn(player->num)) {
@@ -6073,6 +6268,8 @@ void Player_Update(Player* player) {
         }
     }
     Player_FFBUpdateFlightModel(player);
+    Player_FFBUpdateHeadingPID(player);
+    Player_FFBUpdateSquare(player);
     if (player->state > PLAYERSTATE_INIT) {
         Player_UpdateEffects(player);
     }
